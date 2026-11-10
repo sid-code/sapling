@@ -1,0 +1,402 @@
+--- a/eden/fs/cli_rs/edenfs-client/src/methods.rs
++++ b/eden/fs/cli_rs/edenfs-client/src/methods.rs
+@@ -37,6 +37,7 @@
+     AddBindMount,
+     RemoveBindMount,
+     ListMounts,
++    Mount,
+     StreamStartStatus,
+     GetDaemonInfo,
+     Unknown,
+--- a/eden/fs/cli_rs/edenfs-client/src/thrift_daemon.rs
++++ b/eden/fs/cli_rs/edenfs-client/src/thrift_daemon.rs
+@@ -19,6 +19,7 @@
+ use edenfs_core::daemon::encode_path;
+ use edenfs_core::daemon::request_error;
+ use edenfs_error::ConnectAndRequestError;
++use thrift_types::edenfs::MountArgument;
+ use thrift_types::edenfs::MountId;
+ use thrift_types::edenfs::MountInfo;
+ use thrift_types::edenfs::UnmountArgument;
+@@ -87,6 +88,24 @@
+         .map_err(|error| classify("listMounts", error))
+     }
+ 
++    async fn mount(
++        &self,
++        mount_point: &Path,
++        client_dir: &Path,
++        read_only: bool,
++    ) -> DaemonResult<()> {
++        let argument = MountArgument {
++            mountPoint: encode_path("mount", mount_point)?,
++            edenClientPath: encode_path("mount", client_dir)?,
++            readOnly: read_only,
++            ..Default::default()
++        };
++        self.with_thrift(|thrift| (thrift.mount(&argument), EdenThriftMethod::Mount))
++            .await
++            .map(|_| ())
++            .map_err(|error| classify("mount", error))
++    }
++
+     async fn unmount_v2(&self, mount_point: &Path, use_force: bool) -> DaemonResult<()> {
+         let unmount_argument = UnmountArgument {
+             mountId: MountId {
+--- a/eden/fs/cli_rs/edenfs-core/src/daemon.rs
++++ b/eden/fs/cli_rs/edenfs-core/src/daemon.rs
+@@ -22,6 +22,7 @@
+ use edenfs_utils::bytes_from_path;
+ use fbthrift_socket::SocketTransport;
+ use thiserror::Error;
++use thrift_types::edenfs::MountArgument;
+ use thrift_types::edenfs::MountId;
+ use thrift_types::edenfs::MountInfo;
+ use thrift_types::edenfs::UnmountArgument;
+@@ -100,6 +101,14 @@
+     /// timeout and ignore the error.
+     async fn list_mounts(&self, conn_timeout: Option<Duration>) -> DaemonResult<Vec<MountInfo>>;
+ 
++    /// Thrift `mount`.
++    async fn mount(
++        &self,
++        mount_point: &Path,
++        client_dir: &Path,
++        read_only: bool,
++    ) -> DaemonResult<()>;
++
+     /// Thrift `unmountV2`.
+     async fn unmount_v2(&self, mount_point: &Path, use_force: bool) -> DaemonResult<()>;
+ 
+@@ -239,6 +248,24 @@
+             .map_err(|error| request_error("listMounts", error))
+     }
+ 
++    async fn mount(
++        &self,
++        mount_point: &Path,
++        client_dir: &Path,
++        read_only: bool,
++    ) -> DaemonResult<()> {
++        let argument = MountArgument {
++            mountPoint: encode_path("mount", mount_point)?,
++            edenClientPath: encode_path("mount", client_dir)?,
++            readOnly: read_only,
++            ..Default::default()
++        };
++        let (client, _cancellation) = self.connect(None).await?;
++        with_request_timeout("mount", client.mount(&argument))
++            .await?
++            .map_err(|error| request_error("mount", error))
++    }
++
+     async fn unmount_v2(&self, mount_point: &Path, use_force: bool) -> DaemonResult<()> {
+         let unmount_argument = UnmountArgument {
+             mountId: MountId {
+@@ -304,6 +331,15 @@
+         Err(self.error())
+     }
+ 
++    async fn mount(
++        &self,
++        _mount_point: &Path,
++        _client_dir: &Path,
++        _read_only: bool,
++    ) -> DaemonResult<()> {
++        Err(self.error())
++    }
++
+     async fn unmount_v2(&self, _mount_point: &Path, _use_force: bool) -> DaemonResult<()> {
+         Err(self.error())
+     }
+--- a/eden/fs/cli_rs/edenfs-core/src/instance.rs
++++ b/eden/fs/cli_rs/edenfs-core/src/instance.rs
+@@ -114,8 +114,13 @@
+ use crate::daemon::EdenFsDaemon;
+ 
+ // Default config and etc dirs
+-#[cfg(unix)]
++//
++// fbcode builds keep their state under ~/local/.eden; the open-source build
++// uses ~/.eden, which is also the daemon's default (kDefaultEdenDirectory).
++#[cfg(all(unix, fbcode_build))]
+ pub const DEFAULT_CONFIG_DIR: &str = "~/local/.eden";
++#[cfg(all(unix, not(fbcode_build)))]
++pub const DEFAULT_CONFIG_DIR: &str = "~/.eden";
+ #[cfg(unix)]
+ pub const DEFAULT_ETC_EDEN_DIR: &str = "/etc/eden";
+ 
+@@ -798,6 +803,38 @@
+             )
+         })?;
+         Ok(())
++    }
++
++    /// Register `path` as the checkout whose state is the client directory
++    /// `client_name`, as `eden clone` does. Fails if config.json already lists
++    /// the path.
++    pub fn add_path_to_directory_map(&self, path: &Path, client_name: &str) -> Result<()> {
++        let lock_file_path = self.config_dir.join(CONFIG_JSON_LOCK);
++        let config_file_path = self.config_dir.join(CONFIG_JSON);
++        let _lock = PathLock::exclusive(&lock_file_path).with_context(|| {
++            format!("Failed to open the lock file {}", lock_file_path.display())
++        })?;
++
++        let entry_key = dunce::simplified(path);
++        let mut all_checkout_map = self.get_configured_mounts_map()?;
++        if all_checkout_map
++            .keys()
++            .any(|existing| dunce::simplified(existing) == entry_key)
++        {
++            return Err(anyhow!("{} is already listed in config.json", path.display()).into());
++        }
++        all_checkout_map.insert(entry_key.to_path_buf(), client_name.to_owned());
++        atomic_write(&config_file_path, CONFIG_JSON_MODE, true, |f| {
++            serde_json::to_writer_pretty(f, &all_checkout_map)?;
++            Ok(())
++        })
++        .with_context(|| {
++            format!(
++                "Failed to write updated config JSON back to {}",
++                config_file_path.display()
++            )
++        })?;
++        Ok(())
+     }
+ 
+     /// Removes a path from the EdenFS directory map.
+--- a/eden/fs/cli_rs/edenfs-error/src/lib.rs
++++ b/eden/fs/cli_rs/edenfs-error/src/lib.rs
+@@ -27,6 +27,7 @@
+ use thrift_clients::errors::GetScmStatusV2Error;
+ use thrift_clients::errors::GlobFilesError;
+ use thrift_clients::errors::ListMountsError;
++use thrift_clients::errors::MountError;
+ use thrift_clients::errors::PeekCurrentJournalPositionError;
+ use thrift_clients::errors::PrefetchFilesV2Error;
+ use thrift_clients::errors::ReaddirError;
+@@ -242,6 +243,7 @@
+ impl_has_error_handling_strategy!(GetSHA1Error);
+ impl_has_error_handling_strategy!(GlobFilesError);
+ impl_has_error_handling_strategy!(ListMountsError);
++impl_has_error_handling_strategy!(MountError);
+ impl_has_error_handling_strategy!(PeekCurrentJournalPositionError);
+ impl_has_error_handling_strategy!(PrefetchFilesV2Error);
+ impl_has_error_handling_strategy!(ReaddirError);
+--- a/eden/fs/cli_rs/edenfs-commands/src/lib.rs
++++ b/eden/fs/cli_rs/edenfs-commands/src/lib.rs
+@@ -36,6 +36,7 @@
+ mod handles;
+ mod list;
+ mod minitop;
++mod mount;
+ mod notify;
+ mod pid;
+ mod prefetch_profile;
+@@ -175,6 +176,7 @@
+     Fsconfig(crate::config::FsConfigCmd),
+     List(crate::list::ListCmd),
+     Minitop(crate::minitop::MinitopCmd),
++    Mount(crate::mount::MountCmd),
+     #[clap(alias = "notification")]
+     Notify(crate::notify::NotifyCmd),
+     Pid(crate::pid::PidCmd),
+@@ -212,6 +214,7 @@
+             // Gc(cmd) => cmd,
+             List(cmd) => cmd,
+             Minitop(cmd) => cmd,
++            Mount(cmd) => cmd,
+             Notify(cmd) => cmd,
+             Pid(cmd) => cmd,
+             PrefetchProfile(cmd) => cmd,
+@@ -243,6 +246,7 @@
+             TopLevelSubcommand::Handles(_) => "handles",
+             TopLevelSubcommand::List(_) => "list",
+             TopLevelSubcommand::Minitop(_) => "minitop",
++            TopLevelSubcommand::Mount(_) => "mount",
+             TopLevelSubcommand::Notify(_) => "notify",
+             TopLevelSubcommand::Pid(_) => "pid",
+             TopLevelSubcommand::PrefetchProfile(_) => "prefetch-profile",
+--- /dev/null
++++ b/eden/fs/cli_rs/edenfs-commands/src/mount.rs
+@@ -0,0 +1,180 @@
++/*
++ * Copyright (c) Meta Platforms, Inc. and affiliates.
++ *
++ * This software may be used and distributed according to the terms of the
++ * GNU General Public License version 2.
++ */
++
++//! edenfsctl mount
++//!
++//! A small native replacement for the Python `edenfsctl mount`: register a
++//! checkout with the daemon and ask it to mount.  It takes an existing
++//! Sapling/Mercurial repository (a directory containing `.hg`) and a mount
++//! point, writes the per-client `config.toml` the daemon reads, and issues
++//! the `mount` thrift call.
++
++use std::fs;
++use std::path::Path;
++use std::path::PathBuf;
++use std::process::Command;
++
++use anyhow::Context;
++use anyhow::Result;
++use async_trait::async_trait;
++use clap::Parser;
++
++use crate::ExitCode;
++use crate::Subcommand;
++use crate::get_edenfs_instance;
++
++#[derive(Parser, Debug)]
++#[clap(
++    name = "mount",
++    about = "Mount a Sapling/Mercurial checkout with EdenFS"
++)]
++pub struct MountCmd {
++    /// The mount point. Created if it does not exist; it must be empty.
++    #[clap(value_name = "MOUNT_POINT")]
++    mount_point: PathBuf,
++
++    /// The backing repository (a directory containing `.hg` or `.sl`).
++    /// Defaults to the mount point itself.
++    #[clap(long, value_name = "PATH")]
++    repo: Option<PathBuf>,
++
++    /// Mount read-only.
++    #[clap(long)]
++    read_only: bool,
++
++    /// The commit to check out.  Defaults to the repository's current parent
++    /// (queried from `sl`/`hg`).
++    #[clap(long, value_name = "COMMIT")]
++    rev: Option<String>,
++}
++
++#[async_trait]
++impl Subcommand for MountCmd {
++    async fn run(&self) -> Result<ExitCode> {
++        let instance = get_edenfs_instance();
++
++        // The daemon expects an absolute mount point.
++        fs::create_dir_all(&self.mount_point).with_context(|| {
++            format!(
++                "failed to create mount point {}",
++                self.mount_point.display()
++            )
++        })?;
++        let mount_point = self.mount_point.canonicalize().with_context(|| {
++            format!(
++                "failed to canonicalize mount point {}",
++                self.mount_point.display()
++            )
++        })?;
++
++        let repo = match &self.repo {
++            Some(repo) => repo.canonicalize().with_context(|| {
++                format!("failed to canonicalize repository {}", repo.display())
++            })?,
++            None => mount_point.clone(),
++        };
++        if !repo.join(".hg").is_dir() && !repo.join(".sl").is_dir() {
++            anyhow::bail!(
++                "{} is not a Sapling/Mercurial repository (no .hg or .sl directory); pass --repo",
++                repo.display()
++            );
++        }
++        if mount_point == repo {
++            anyhow::bail!(
++                "the mount point must differ from the backing repository ({})",
++                repo.display()
++            );
++        }
++
++        // The client name also names the directory under ~/.eden/clients.
++        let client_name = mount_point
++            .file_name()
++            .map(|name| name.to_string_lossy().into_owned())
++            .context("mount point has no file name")?;
++        let client_dir = instance.config_directory(&client_name);
++        fs::create_dir_all(&client_dir)
++            .with_context(|| format!("failed to create {}", client_dir.display()))?;
++
++        // Record the mount point in ~/.eden/config.json so the daemon (and
++        // later edenfsctl invocations) can resolve it to the client name.
++        if !instance
++            .get_configured_mounts_map()?
++            .contains_key(&mount_point)
++        {
++            instance
++                .add_path_to_directory_map(&mount_point, &client_name)
++                .with_context(|| {
++                    format!(
++                        "failed to record {} in the checkout directory map",
++                        mount_point.display()
++                    )
++                })?;
++        }
++
++        // The checkout config read by CheckoutConfig::loadFromClientDirectory.
++        let config_path = client_dir.join("config.toml");
++        if !config_path.exists() {
++            fs::write(
++                &config_path,
++                format!(
++                    "[repository]\ntype = \"hg\"\npath = \"{}\"\n",
++                    repo.display()
++                ),
++            )
++            .with_context(|| format!("failed to write {}", config_path.display()))?;
++        }
++
++        // EdenFS refuses to mount a client directory that has no SNAPSHOT.
++        let snapshot_id = resolve_snapshot_id(&repo, self.rev.as_deref())?;
++        write_snapshot(&client_dir.join("SNAPSHOT"), &snapshot_id)?;
++
++        instance
++            .daemon()
++            .mount(&mount_point, &client_dir, self.read_only)
++            .await?;
++
++        println!("Mounted {}", mount_point.display());
++        Ok(0)
++    }
++}
++
++/// The commit id written into SNAPSHOT: an explicit `--rev`, otherwise the
++/// repository's current parent.
++fn resolve_snapshot_id(repo: &Path, rev: Option<&str>) -> Result<String> {
++    if let Some(rev) = rev {
++        return Ok(rev.to_owned());
++    }
++    for program in ["sl", "hg"] {
++        if let Ok(output) = Command::new(program)
++            .args(["log", "-r", ".", "-T", "{node}"])
++            .current_dir(repo)
++            .output()
++        {
++            if output.status.success() {
++                let id = String::from_utf8_lossy(&output.stdout).trim().to_owned();
++                if !id.is_empty() {
++                    return Ok(id);
++                }
++            }
++        }
++    }
++    anyhow::bail!(
++        "unable to determine the current commit of {}; pass --rev <commit>",
++        repo.display()
++    )
++}
++
++/// Write a version-2 SNAPSHOT file: `eden` + BE u32 version + BE u32 length +
++/// the commit id as ASCII hex.
++fn write_snapshot(path: &Path, snapshot_id: &str) -> Result<()> {
++    let body = snapshot_id.as_bytes();
++    let mut data = Vec::with_capacity(12 + body.len());
++    data.extend_from_slice(b"eden\x00\x00\x00\x02");
++    data.extend_from_slice(&(body.len() as u32).to_be_bytes());
++    data.extend_from_slice(body);
++    fs::write(path, data).with_context(|| format!("failed to write {}", path.display()))
++}

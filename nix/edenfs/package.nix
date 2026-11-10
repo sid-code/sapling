@@ -216,6 +216,9 @@ stdenv.mkDerivation (finalAttrs: {
     cp ${./Cargo.lock} eden/fs/Cargo.lock
     python3 ${./trim-patches.py} eden/fs/Cargo.toml eden/fs/Cargo.lock
 
+    # Add a native `edenfsctl mount`; this snapshot only ships the Python one.
+    patch -p1 < ${./0001-rust-mount.patch}
+
     # nixpkgs' fbthrift 2026.07.27.00 names the compiler executable
     # FBThrift::thrift1 (FBThrift::thrift is an interface library); this
     # snapshot expects the newer layout where FBThrift::thrift is the binary.

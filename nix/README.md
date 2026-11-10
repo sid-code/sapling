@@ -78,15 +78,87 @@ Four issues had to be fixed to compile the vendored sources (all in
 `xz` (liblzma) and `libunwind` had to be added to `buildInputs` for
 `edenfs`/`edenfs_privhelper` to resolve at runtime.
 
+## Native `edenfsctl mount`
+
+This snapshot only ships a Python `edenfsctl mount`, so `0001-rust-mount.patch`
+adds a native one (applied in `postPatch`):
+
+```console
+$ edenfsctl mount <MOUNT_POINT> --repo <REPO> [--rev <COMMIT>] [--read-only]
+```
+
+It registers the checkout in `~/.eden/config.json`, writes
+`~/.eden/clients/<name>/config.toml` and a version-2 `SNAPSHOT`, then calls the
+daemon's `mount` thrift method.  `--repo` must be a Sapling/Mercurial
+repository, i.e. contain `.hg` (Mercurial) or `.sl` (Sapling's `sl init`
+creates `.sl`).  The commit defaults to the repository's current parent (via
+`sl log -r .`/`hg log -r .`); pass `--rev` if neither tool is installed.
+Git checkouts are not supported (the build sets `ENABLE_GIT=OFF`).  The
+default config dir is `~/.eden` in the OSS build (matching the daemon);
+Meta's `~/local/.eden` is kept under `cfg(fbcode_build)`.
+
+## NixOS module
+
+`flake.nix` exposes `nixosModules.edenfs` (aliased as `nixosModules.default`)
+and an overlay providing `pkgs.edenfs`:
+
+```nix
+{
+  inputs.sapling.url = "path:/path/to/sapling";
+
+  outputs = { self, nixpkgs, sapling }: {
+    nixosConfigurations.host = nixpkgs.lib.nixosSystem {
+      system = "x86_64-linux";
+      modules = [
+        sapling.nixosModules.edenfs
+        {
+          services.edenfs = {
+            enable = true;
+            # optional: mount checkouts once the daemon is up
+            mounts = [
+              { mountPoint = "/home/me/src/proj"; repo = "/home/me/src/proj-repo"; }
+            ];
+          };
+        }
+      ];
+    };
+  };
+}
+```
+
+The module wires up:
+
+* `security.wrappers.edenfs_privhelper` — the setuid-root helper (Nix store
+  files cannot carry setuid bits).
+* `boot.kernelModules = [ "fuse" ]`.
+* `/etc/eden/config.d/edenfs.ini`, carrying `services.edenfs.extraConfig`.
+* `edenfs`/`edenfsctl` in `environment.systemPackages`.
+* A per-user `systemd.user.services.edenfs` running
+  `edenfs --foreground --privhelper_path=/run/wrappers/bin/edenfs_privhelper`.
+* Optional `services.edenfs.mounts`, run through `edenfsctl mount` after the
+  daemon starts (best effort).
+
+EdenFS is per-user, so the daemon lives in the user manager: it starts when
+that user's systemd instance starts (on login), or at boot with
+`users.users.<name>.linger = true`.
+
+`mounts` derive the commit from the repository's current parent via
+`sl`/`hg`; install one of them (e.g. `environment.systemPackages = [ pkgs.sapling ];`)
+or set `rev` explicitly.
+
 ## Caveats
 
-* **`edenfsctl` is only a launcher.**  At this snapshot the Rust `edenfsctl`
-  looks for a Python `edenfsctl.real` fallback and execs it, so it needs the
-  Phase-2 Python CLI to be useful.  It builds and links, but running it
-  without the Python CLI reports "unable to locate fallback binary".
-* **NixOS runtime.**  `edenfs_privhelper` must be setuid root (use
-  `security.wrappers`), `/dev/fuse` must be available, and `/etc/eden` must
-  exist.  There is no NixOS module yet.
+* **`edenfsctl` is a launcher for the other commands.**  Query/debug commands
+  (`status`, `list`, `pid`, `du`, …) run natively; everything else is
+  forwarded to a Python `edenfsctl.real`, which is not built in Phase 1.  The
+  native `mount` above is the exception.
+* **Runtime.**  The NixOS module handles the setuid privhelper, `/dev/fuse`
+  and `/etc/eden`.  Without it, `edenfs_privhelper` must be setuid root (e.g.
+  `security.wrappers`) and the daemon started with
+  `--privhelper_path=/run/wrappers/bin/edenfs_privhelper`; otherwise the mount
+  reaches the daemon and fails with `failed to open filesystem context for
+  \`fuse\`: Operation not permitted`.
+
 
 ## Phased plan
 

@@ -16,6 +16,17 @@
       forAllSystems = f: nixpkgs.lib.genAttrs systems (system: f nixpkgs.legacyPackages.${system});
     in
     {
+      overlays.default = final: prev: {
+        edenfs = final.callPackage ./nix/edenfs/package.nix {
+          edencommon = final.callPackage ./nix/edencommon.nix { };
+        };
+      };
+
+      nixosModules = {
+        edenfs = ./nix/edenfs/module.nix;
+        default = self.nixosModules.edenfs;
+      };
+
       packages = forAllSystems (pkgs: {
         # Phase 1 target: the C++ daemon + Rust static lib + edenfsctl
         # (no Python CLI, no tests).  The source is pinned inside package.nix
