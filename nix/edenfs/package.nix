@@ -4,6 +4,7 @@
   fetchFromGitHub,
   cmake,
   ninja,
+  libgit2,
   pkg-config,
   python3,
   rustc,
@@ -96,38 +97,41 @@ let
   # A copy of the vendor directory in which the thrift-codegen crates are
   # dereferenced (so their build scripts run inside our tree) and patched to
   # use thriftRoot.  Everything else stays a symlink.
-  cargoVendorFixed = runCommand "edenfs-cargo-vendor-fixed" {
-    nativeBuildInputs = [ python3 ];
-  } ''
-    mkdir -p $out
-    for crate in ${cargoDeps}/*; do
-      name=$(basename "$crate")
-      case "$name" in
-        # cxx's crates build.rs does include!("../tools/cargo/build.rs").  The
-        # `cxx` vendor entry happens to be the whole cxx repo, so dereference
-        # these and repoint the include at that copy below.
-        cxx-*|cxxbridge-*)
-          cp -rL "$crate" "$out/$name"
-          chmod -R u+w "$out/$name"
-          ;;
-        *)
-          if [ -f "$crate/thrift_build.rs" ]; then
-            cp -rL "$crate" "$out/$name"
-            chmod -R u+w "$out/$name"
-            python3 ${./fix-thrift-build.py} "$out/$name/thrift_build.rs" "${thriftRoot}"
-          else
-            ln -s "$crate" "$out/$name"
-          fi
-          ;;
-      esac
-    done
+  cargoVendorFixed =
+    runCommand "edenfs-cargo-vendor-fixed"
+      {
+        nativeBuildInputs = [ python3 ];
+      }
+      ''
+        mkdir -p $out
+        for crate in ${cargoDeps}/*; do
+          name=$(basename "$crate")
+          case "$name" in
+            # cxx's crates build.rs does include!("../tools/cargo/build.rs").  The
+            # `cxx` vendor entry happens to be the whole cxx repo, so dereference
+            # these and repoint the include at that copy below.
+            cxx-*|cxxbridge-*)
+              cp -rL "$crate" "$out/$name"
+              chmod -R u+w "$out/$name"
+              ;;
+            *)
+              if [ -f "$crate/thrift_build.rs" ]; then
+                cp -rL "$crate" "$out/$name"
+                chmod -R u+w "$out/$name"
+                python3 ${./fix-thrift-build.py} "$out/$name/thrift_build.rs" "${thriftRoot}"
+              else
+                ln -s "$crate" "$out/$name"
+              fi
+              ;;
+          esac
+        done
 
-    cxx_repo=$(ls -d "$out"/cxx-[0-9]* | head -1)
-    for f in "$out"/cxxbridge-macro-*/build.rs "$out"/cxx-build-*/build.rs \
-             "$out"/cxxbridge-cmd-*/build.rs; do
-      [ -f "$f" ] && echo "include!(\"$cxx_repo/tools/cargo/build.rs\");" > "$f"
-    done
-  '';
+        cxx_repo=$(ls -d "$out"/cxx-[0-9]* | head -1)
+        for f in "$out"/cxxbridge-macro-*/build.rs "$out"/cxx-build-*/build.rs \
+                 "$out"/cxxbridge-cmd-*/build.rs; do
+          [ -f "$f" ] && echo "include!(\"$cxx_repo/tools/cargo/build.rs\");" > "$f"
+        done
+      '';
 
   # `importCargoLock` returns a directory that (a) symlinks every vendored
   # crate as <name>-<version> and (b) contains a `.cargo/config.toml` that
@@ -190,6 +194,7 @@ stdenv.mkDerivation (finalAttrs: {
     # edencommon's public headers use gtest's FRIEND_TEST macro, so gtest is
     # needed even when BUILD_TESTS is off.
     gtest
+    libgit2
   ]
   ++ lib.optionals stdenv.hostPlatform.isLinux [ systemd ];
 
@@ -197,9 +202,7 @@ stdenv.mkDerivation (finalAttrs: {
     (lib.cmakeBool "BUILD_TESTS" buildTests)
     (lib.cmakeBool "ENABLE_THRIFT_PYTHON" enablePython)
     (lib.cmakeBool "FETCHCONTENT_FULLY_DISCONNECTED" true)
-    # Git repository support is optional; keep it off so configure doesn't
-    # chase libgit2.
-    (lib.cmakeFeature "ENABLE_GIT" "OFF")
+    (lib.cmakeFeature "ENABLE_GIT" "ON")
     (lib.cmakeFeature "CMAKE_BUILD_TYPE" "Release")
     # fbthrift's .thrift annotation files; EdenConfigChecks feeds this (and
     # fb303's) to the Rust thrift build scripts via THRIFT_INCLUDE_PATH.
